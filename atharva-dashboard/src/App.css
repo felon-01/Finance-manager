@@ -189,3 +189,31 @@ tr:hover {
   color: #ff5252;
   font-weight: 500;
 }
+
+.nav-button {
+  background: #444;
+  color: white;
+  padding: 8px 14px;
+  margin-right: 10px;
+  border-radius: 8px;
+  text-decoration: none;
+  transition: 0.2s ease;
+}
+
+.nav-button:hover {
+  background: #666;
+}
+
+.logout-button {
+  background: #c62828;
+  color: white;
+  border: none;
+  padding: 8px 14px;
+  border-radius: 8px;
+  cursor: pointer;
+  transition: 0.2s ease;
+}
+
+.logout-button:hover {
+  background: #e53935;
+}

@@ -16,9 +16,23 @@ function CategoryBreakdownChart() {
       });
   }, []);
 
+  // Formatter for Rupee values
+  const formatRupee = (value) => `₹${value.toLocaleString("en-IN")}`;
+
   return (
-    <div style={{ marginTop: "2rem", background: "#1e1e1e", padding: "1rem", borderRadius: "12px", boxShadow: "0 0 10px #000" }}>
-      <h2 style={{ textAlign: "center", marginBottom: "1rem" }}>Expense Breakdown by Category</h2>
+    <div
+      style={{
+        marginTop: "2rem",
+        background: "#1e1e1e",
+        padding: "1rem",
+        borderRadius: "12px",
+        boxShadow: "0 0 10px #000",
+        color: "white"
+      }}
+    >
+      <h2 style={{ textAlign: "center", marginBottom: "1rem" }}>
+        Expense Breakdown by Category
+      </h2>
       <ResponsiveContainer width="100%" height={300}>
         <PieChart>
           <Pie
@@ -28,13 +42,13 @@ function CategoryBreakdownChart() {
             cx="50%"
             cy="50%"
             outerRadius={100}
-            label
+            label={({ name, value }) => `${name}: ${formatRupee(value)}`} // label with ₹
           >
             {data.map((entry, index) => (
               <Cell key={`cell-${index}`} fill={COLORS[index % COLORS.length]} />
             ))}
           </Pie>
-          <Tooltip />
+          <Tooltip formatter={(value) => formatRupee(value)} /> {/* tooltip with ₹ */}
           <Legend />
         </PieChart>
       </ResponsiveContainer>

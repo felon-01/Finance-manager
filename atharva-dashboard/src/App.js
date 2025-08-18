@@ -1,4 +1,5 @@
 import { useState, useEffect } from "react";
+import { BrowserRouter as Router, Routes, Route, Link } from "react-router-dom"; // ✅ Router setup
 import { getTransactions, getBalance, addTransaction } from "./api";
 import BalanceCard from "./BalanceCard";
 import TransactionTable from "./TransactionTable";
@@ -11,8 +12,9 @@ import LoginForm from "./LoginForm";
 import RegisterForm from "./RegisterForm";
 import { getToken, logout } from "./auth";
 import TransactionHistory from "./TransactionHistory";
+import UploadPage from "./UploadPage";
 import "./App.css";
-import "./index.css"; // ✅ THIS IS CRUCIAL
+import "./index.css";
 
 export default function App() {
   const [loggedIn, setLoggedIn] = useState(!!getToken());
@@ -48,7 +50,7 @@ export default function App() {
     }
   };
 
-  // 🔐 LOGIN/REGISTER SWITCH
+  // 🔐 LOGIN/REGISTER
   if (!loggedIn) {
     return (
       <div className="auth-container">
@@ -71,39 +73,82 @@ export default function App() {
     );
   }
 
-  // ✅ MAIN DASHBOARD
-  if (loading) return <p className="center">Loading...</p>;
-  if (error) return <p className="center error">{error}</p>;
-
+  // ✅ MAIN APP ROUTES
   return (
-  <div className="app">
-    <div className="header">
-      <h1 style={{ flexGrow: 1 }}>Finance Manager 💰</h1>
-      <button
-        onClick={() => {
-          logout();
-          setLoggedIn(false);
-        }}
-        className="logout-button"
-      >
-        🔒 Logout
-      </button>
-    </div>
+    <Router>
+      <Routes>
+        {/* Dashboard */}
+        <Route
+          path="/"
+          element={
+            <div className="app">
+              {/* 🔹 HEADER */}
+              <div className="header">
+                <h1 style={{ flexGrow: 1 }}>Finance Manager 💰</h1>
+                <nav>
+                  <Link to="/upload" className="nav-button">
+                    ⬆ Upload
+                  </Link>
+                  <button
+                    onClick={() => {
+                      logout();
+                      setLoggedIn(false);
+                    }}
+                    className="logout-button"
+                  >
+                    🔒 Logout
+                  </button>
+                </nav>
+              </div>
 
-    <div className="card-grid">
-      <BalanceCard label="Income" amount={totals.income} color="#2e7d32" />
-      <BalanceCard label="Expenses" amount={totals.expense} color="#c62828" />
-      <BalanceCard label="Balance" amount={totals.balance} color="#1565c0" />
-    </div>
+              {/* 🔹 CARDS */}
+              <div className="card-grid">
+                <BalanceCard label="Income" amount={totals.income} color="#2e7d32" />
+                <BalanceCard label="Expenses" amount={totals.expense} color="#c62828" />
+                <BalanceCard label="Balance" amount={totals.balance} color="#1565c0" />
+              </div>
 
-    <AddTransactionForm onAdd={handleAdd} />
-    <TransactionTable transactions={transactions} />
-    <MonthlySummaryChart />
-    <IncomeExpenseChart />
-    <CategoryBreakdownChart />
-    <MonthlySavingsChart />
-    <TransactionHistory />
-  </div>
-);
+              {/* 🔹 FORMS & DATA */}
+              <AddTransactionForm onAdd={handleAdd} />
+              <TransactionTable transactions={transactions} />
 
+              {/* 🔹 CHARTS */}
+              <MonthlySummaryChart />
+              <IncomeExpenseChart />
+              <CategoryBreakdownChart />
+              <MonthlySavingsChart />
+              <TransactionHistory />
+            </div>
+          }
+        />
+
+        {/* Upload Page */}
+        <Route
+          path="/upload"
+          element={
+            <div className="app">
+              <div className="header">
+                <h1 style={{ flexGrow: 1 }}>Upload Transactions 📂</h1>
+                <nav>
+                  <Link to="/" className="nav-button">
+                    ⬅ Back to Dashboard
+                  </Link>
+                  <button
+                    onClick={() => {
+                      logout();
+                      setLoggedIn(false);
+                    }}
+                    className="logout-button"
+                  >
+                    🔒 Logout
+                  </button>
+                </nav>
+              </div>
+              <UploadPage />
+            </div>
+          }
+        />
+      </Routes>
+    </Router>
+  );
 }

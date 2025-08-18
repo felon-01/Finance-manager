@@ -8,6 +8,17 @@ from flask_cors import CORS
 from datetime import datetime
 from utils import categorize
 from storage import db
+from werkzeug.utils import secure_filename
+import os
+import uuid
+import pandas as pd
+import pdfplumber
+import re
+import logging
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 model = joblib.load('transaction_classifier.pkl')
 app = Flask(__name__)
@@ -17,31 +28,360 @@ app.config['JWT_SECRET_KEY'] = 'your-secret-key'  # Use a strong secret in produ
 jwt = JWTManager(app)
 app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///data.db'
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+app.config['UPLOAD_FOLDER'] = 'uploads'
+app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16MB max file size
+
+# Create upload folder if it doesn't exist
+os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
+
 db.init_app(app)
 
 from models import Transaction
 
+# Bank Statement Parser Class
+class BankStatementParser:
+    def __init__(self):
+        self.category_mapping = {
+            'food_dining': ['restaurant', 'cafe', 'food', 'dining', 'swiggy', 'zomato', 'uber eats', 'dominos'],
+            'transport': ['uber', 'ola', 'metro', 'bus', 'taxi', 'fuel', 'petrol', 'diesel', 'parking'],
+            'shopping': ['amazon', 'flipkart', 'mall', 'store', 'shopping', 'myntra', 'ajio'],
+            'utilities': ['electricity', 'water', 'gas', 'internet', 'mobile', 'broadband', 'wifi'],
+            'entertainment': ['movie', 'netflix', 'spotify', 'game', 'theater', 'concert'],
+            'healthcare': ['hospital', 'medical', 'pharmacy', 'doctor', 'clinic', 'medicine'],
+            'salary': ['salary', 'wages', 'income', 'payroll', 'bonus'],
+            'transfer': ['transfer', 'upi', 'neft', 'rtgs', 'imps', 'paytm', 'gpay'],
+            'investment': ['mutual fund', 'sip', 'stock', 'equity', 'bond', 'fd'],
+            'bills': ['bill', 'insurance', 'emi', 'loan', 'rent'],
+            'cash': ['atm', 'cash withdrawal', 'cash deposit'],
+            'education': ['school', 'college', 'course', 'book', 'tuition'],
+            'groceries': ['grocery', 'supermarket', 'vegetables', 'fruits', 'milk']
+        }
+    
+    def categorize_transaction(self, description):
+        """Categorize transaction using ML model or keyword matching"""
+        if not description:
+            return 'other'
+        
+        try:
+            # First try using your existing ML model
+            predicted_category = model.predict([description])[0]
+            return predicted_category
+        except:
+            # Fallback to keyword matching
+            description_lower = description.lower()
+            for category, keywords in self.category_mapping.items():
+                if any(keyword in description_lower for keyword in keywords):
+                    return category
+            return 'other'
+    
+    def clean_amount(self, amount_str):
+        """Clean and convert amount string to float"""
+        if pd.isna(amount_str) or str(amount_str).strip() == '':
+            return 0.0
+        
+        # Remove currency symbols, commas
+        cleaned = re.sub(r'[₹$€£,\s]', '', str(amount_str))
+        
+        # Handle negative amounts in parentheses
+        if '(' in cleaned and ')' in cleaned:
+            cleaned = cleaned.replace('(', '-').replace(')', '')
+        
+        try:
+            return float(cleaned)
+        except (ValueError, TypeError):
+            return 0.0
+    
+    def parse_date(self, date_str):
+        """Parse date string to datetime object"""
+        if pd.isna(date_str) or str(date_str).strip() == '':
+            return None
+        
+        date_str = str(date_str).strip()
+        formats = [
+            '%d/%m/%Y', '%m/%d/%Y', '%Y-%m-%d', '%d-%m-%Y',
+            '%d %b %Y', '%d %B %Y', '%b %d, %Y', '%B %d, %Y',
+            '%d/%m/%y', '%m/%d/%y', '%d-%m-%y'
+        ]
+        
+        for fmt in formats:
+            try:
+                return datetime.strptime(date_str, fmt)
+            except ValueError:
+                continue
+        
+        return None
+    
+    def detect_csv_columns(self, df):
+        """Detect column mappings from CSV headers"""
+        columns = [col.lower().strip() for col in df.columns]
+        mapping = {}
+        
+        # Date column
+        for col in df.columns:
+            col_lower = col.lower()
+            if any(word in col_lower for word in ['date', 'txn date', 'transaction date']):
+                mapping['date'] = col
+                break
+        
+        # Description column
+        for col in df.columns:
+            col_lower = col.lower()
+            if any(word in col_lower for word in ['description', 'narration', 'particulars', 'details']):
+                mapping['description'] = col
+                break
+        
+        # Amount columns
+        for col in df.columns:
+            col_lower = col.lower()
+            if 'debit' in col_lower or 'withdrawal' in col_lower:
+                mapping['debit'] = col
+            elif 'credit' in col_lower or 'deposit' in col_lower:
+                mapping['credit'] = col
+            elif 'balance' in col_lower:
+                mapping['balance'] = col
+            elif 'amount' in col_lower and 'debit' not in mapping and 'credit' not in mapping:
+                mapping['amount'] = col
+        
+        return mapping
+    
+    def parse_csv(self, file_path):
+        """Parse CSV bank statement"""
+        transactions = []
+        
+        try:
+            # Try different encodings
+            encodings = ['utf-8', 'latin-1', 'cp1252']
+            df = None
+            
+            for encoding in encodings:
+                try:
+                    df = pd.read_csv(file_path, encoding=encoding)
+                    break
+                except UnicodeDecodeError:
+                    continue
+            
+            if df is None or df.empty:
+                raise ValueError("Could not read CSV file")
+            
+            # Detect columns
+            column_mapping = self.detect_csv_columns(df)
+            
+            if not column_mapping.get('date') or not column_mapping.get('description'):
+                raise ValueError("Could not identify required columns")
+            
+            for _, row in df.iterrows():
+                try:
+                    # Parse date
+                    date_str = row.get(column_mapping['date'])
+                    transaction_date = self.parse_date(date_str)
+                    if not transaction_date:
+                        continue
+                    
+                    # Get description
+                    description = str(row.get(column_mapping['description'], '')).strip()
+                    if not description or description.lower() == 'nan':
+                        continue
+                    
+                    # Parse amounts
+                    if 'amount' in column_mapping:
+                        amount = self.clean_amount(row.get(column_mapping['amount']))
+                        trans_type = 'expense'  # Default
+                    else:
+                        debit = self.clean_amount(row.get(column_mapping.get('debit', ''), 0))
+                        credit = self.clean_amount(row.get(column_mapping.get('credit', ''), 0))
+                        
+                        if debit > 0:
+                            amount = debit
+                            trans_type = 'expense'
+                        elif credit > 0:
+                            amount = credit
+                            trans_type = 'income'
+                        else:
+                            continue
+                    
+                    if amount == 0:
+                        continue
+                    
+                    # Categorize
+                    category = self.categorize_transaction(description)
+                    
+                    transactions.append({
+                        'description': description,
+                        'amount': amount,
+                        'timestamp': transaction_date,
+                        'type': trans_type,
+                        'category': category
+                    })
+                    
+                except Exception as e:
+                    logger.warning(f"Error processing CSV row: {e}")
+                    continue
+            
+            return transactions
+            
+        except Exception as e:
+            logger.error(f"CSV parsing error: {e}")
+            raise
+    
+    def parse_pdf(self, file_path):
+        """Parse PDF bank statement"""
+        transactions = []
+        
+        try:
+            text = ""
+            with pdfplumber.open(file_path) as pdf:
+                for page in pdf.pages:
+                    page_text = page.extract_text()
+                    if page_text:
+                        text += page_text + "\n"
+            
+            if not text:
+                raise ValueError("Could not extract text from PDF")
+            
+            # Common transaction patterns
+            patterns = [
+                r'(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})\s+(.+?)\s+(\d+[,.]?\d*\.?\d{2})\s*(dr|cr|debit|credit)',
+                r'(\d{1,2}\s+(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\s+\d{4})\s+(.+?)\s+(\d+[,.]?\d*\.?\d{2})'
+            ]
+            
+            for pattern in patterns:
+                matches = re.findall(pattern, text, re.IGNORECASE | re.MULTILINE)
+                
+                for match in matches:
+                    try:
+                        date_str = match[0]
+                        description = match[1] if len(match) > 1 else "Transaction"
+                        amount_str = match[2] if len(match) > 2 else "0"
+                        
+                        date = self.parse_date(date_str)
+                        if not date:
+                            continue
+                        
+                        amount = self.clean_amount(amount_str)
+                        if amount == 0:
+                            continue
+                        
+                        # Determine type based on context
+                        trans_type = 'expense'  # Default
+                        if len(match) > 3:
+                            type_indicator = match[3].lower()
+                            if 'cr' in type_indicator or 'credit' in type_indicator:
+                                trans_type = 'income'
+                        
+                        category = self.categorize_transaction(description)
+                        
+                        transactions.append({
+                            'description': description.strip(),
+                            'amount': amount,
+                            'timestamp': date,
+                            'type': trans_type,
+                            'category': category
+                        })
+                        
+                    except Exception as e:
+                        logger.warning(f"Error parsing PDF transaction: {e}")
+                        continue
+            
+            return transactions
+            
+        except Exception as e:
+            logger.error(f"PDF parsing error: {e}")
+            raise
+
+# Initialize parser
+parser = BankStatementParser()
+
+def allowed_file(filename):
+    """Check if file extension is allowed"""
+    return '.' in filename and filename.rsplit('.', 1)[1].lower() in {'csv', 'pdf'}
 
 # -------------------------
-# POST /transactions: Add a new transaction
+# POST /transactions: Add a new transaction - FIXED VERSION
+# -------------------------
+# -------------------------
+# POST /transactions: Add a new transaction - FIXED VERSION
 # -------------------------
 @app.route('/transactions', methods=['POST'])
 def add_transaction():
     data = request.get_json()
+    
+    # Log the incoming data for debugging
+    logger.info(f"Received transaction data: {data}")
+    
     description = data.get('description')
     amount = data.get('amount')
-    timestamp_str = data.get('timestamp')  # example: '2025-07-22T14:30:00'
+    # FIX: Accept both 'date' and 'timestamp' fields
+    timestamp_str = data.get('date') or data.get('timestamp')  # Frontend sends 'date'
     trans_type = data.get('type')
 
-    # Parse timestamp string into datetime object
+    # Validate required fields
+    if not description or not amount or not trans_type:
+        missing_fields = []
+        if not description: missing_fields.append('description')
+        if not amount: missing_fields.append('amount') 
+        if not trans_type: missing_fields.append('type')
+        return jsonify({'error': f'Missing required fields: {", ".join(missing_fields)}'}), 400
+
+    # Validate and convert amount
     try:
-        timestamp = datetime.fromisoformat(timestamp_str)
-    except ValueError:
-        return jsonify({'error': 'Invalid timestamp format'}), 400
+        amount = float(amount)
+        if amount <= 0:
+            return jsonify({'error': 'Amount must be greater than 0'}), 400
+    except (ValueError, TypeError):
+        return jsonify({'error': 'Invalid amount format'}), 400
+
+    # Validate transaction type
+    if trans_type not in ['income', 'expense']:
+        return jsonify({'error': 'Type must be either "income" or "expense"'}), 400
+
+    # Parse timestamp/date
+    try:
+        if timestamp_str:
+            # Handle different timestamp formats from frontend
+            if isinstance(timestamp_str, str):
+                # Remove 'Z' suffix if present
+                timestamp_str = timestamp_str.replace('Z', '')
+                
+                # Try parsing different date formats
+                timestamp = None
+                formats = [
+                    '%Y-%m-%d',  # This is what your frontend sends: "2003-02-23"
+                    '%Y-%m-%dT%H:%M:%S.%f',
+                    '%Y-%m-%dT%H:%M:%S',
+                    '%Y-%m-%d %H:%M:%S',
+                    '%d/%m/%Y',
+                    '%m/%d/%Y'
+                ]
+                
+                for fmt in formats:
+                    try:
+                        timestamp = datetime.strptime(timestamp_str, fmt)
+                        break
+                    except ValueError:
+                        continue
+                
+                if not timestamp:
+                    return jsonify({'error': f'Invalid date format. Received: {timestamp_str}'}), 400
+            else:
+                return jsonify({'error': 'Date must be a string'}), 400
+        else:
+            # If no timestamp provided, use current time
+            timestamp = datetime.now()
+    
+    except Exception as e:
+        logger.error(f"Timestamp parsing error: {e}")
+        return jsonify({'error': f'Date parsing failed: {str(e)}'}), 400
 
     # Predict category using ML model
-    predicted_category = model.predict([description])[0]
+    try:
+        predicted_category = model.predict([description])[0]
+        logger.info(f"ML prediction successful: {predicted_category}")
+    except Exception as e:
+        logger.warning(f"ML prediction failed: {e}")
+        # Fallback to parser categorization
+        predicted_category = parser.categorize_transaction(description)
 
+    # Create transaction
     transaction = Transaction(
         amount=amount,
         category=predicted_category,
@@ -49,17 +389,266 @@ def add_transaction():
         type=trans_type,
         description=description
     )
-    db.session.add(transaction)
-    db.session.commit()
-
-    return jsonify({'message': 'Transaction added successfully', 'category': predicted_category})
-
-
     
- # -------------------------
-# register
-# ------------------------- 
+    try:
+        db.session.add(transaction)
+        db.session.commit()
+        
+        logger.info(f"Transaction saved successfully: ID={transaction.id}")
+        
+        return jsonify({
+            'message': 'Transaction added successfully', 
+            'category': predicted_category,
+            'id': transaction.id,
+            'transaction': {
+                'id': transaction.id,
+                'description': transaction.description,
+                'amount': transaction.amount,
+                'type': transaction.type,
+                'category': transaction.category,
+                'timestamp': transaction.timestamp.isoformat()
+            }
+        }), 201
+        
+    except Exception as e:
+        db.session.rollback()
+        logger.error(f"Database error: {e}")
+        return jsonify({'error': f'Failed to save transaction: {str(e)}'}), 500
+# -------------------------
+# Bank Statement Upload and Parsing
+# -------------------------
+@app.route('/upload-statement', methods=['POST'])
+@jwt_required()
+def upload_statement():
+    """Upload and parse bank statement"""
+    try:
+        current_user = get_jwt_identity()
+        
+        if 'file' not in request.files:
+            return jsonify({'error': 'No file uploaded'}), 400
+        
+        file = request.files['file']
+        
+        if file.filename == '':
+            return jsonify({'error': 'No file selected'}), 400
+        
+        if not allowed_file(file.filename):
+            return jsonify({'error': 'File type not allowed. Please upload CSV or PDF files only.'}), 400
+        
+        # Save file securely
+        filename = secure_filename(file.filename)
+        unique_filename = f"{uuid.uuid4()}_{filename}"
+        file_path = os.path.join(app.config['UPLOAD_FOLDER'], unique_filename)
+        file.save(file_path)
+        
+        try:
+            # Parse the statement
+            file_extension = filename.rsplit('.', 1)[1].lower()
+            
+            if file_extension == 'csv':
+                parsed_transactions = parser.parse_csv(file_path)
+            elif file_extension == 'pdf':
+                parsed_transactions = parser.parse_pdf(file_path)
+            else:
+                return jsonify({'error': 'Unsupported file type'}), 400
+            
+            # Save parsed transactions to database
+            saved_count = 0
+            errors = []
+            
+            for trans_data in parsed_transactions:
+                try:
+                    # Check for duplicates
+                    existing = Transaction.query.filter_by(
+                        description=trans_data['description'],
+                        amount=trans_data['amount'],
+                        timestamp=trans_data['timestamp'],
+                        user_id=current_user
+                    ).first()
+                    
+                    if existing:
+                        continue  # Skip duplicates
+                    
+                    transaction = Transaction(
+                        user_id=current_user,
+                        description=trans_data['description'],
+                        amount=trans_data['amount'],
+                        timestamp=trans_data['timestamp'],
+                        type=trans_data['type'],
+                        category=trans_data['category']
+                    )
+                    
+                    db.session.add(transaction)
+                    saved_count += 1
+                    
+                except Exception as e:
+                    errors.append(f"Error saving transaction: {str(e)}")
+                    continue
+            
+            db.session.commit()
+            
+            # Clean up uploaded file
+            os.remove(file_path)
+            
+            return jsonify({
+                'success': True,
+                'message': f'Successfully processed {len(parsed_transactions)} transactions',
+                'saved_count': saved_count,
+                'total_parsed': len(parsed_transactions),
+                'errors': errors[:5]  # Return first 5 errors if any
+            }), 200
+            
+        except Exception as parse_error:
+            # Clean up file on error
+            if os.path.exists(file_path):
+                os.remove(file_path)
+            
+            logger.error(f"Statement parsing error: {parse_error}")
+            return jsonify({
+                'error': 'Failed to parse statement',
+                'details': str(parse_error)
+            }), 500
+        
+    except Exception as e:
+        logger.error(f"Upload error: {e}")
+        return jsonify({'error': 'Internal server error'}), 500
 
+# -------------------------
+# Get parsing history
+# -------------------------
+@app.route('/parsing-history', methods=['GET'])
+@jwt_required()
+def get_parsing_history():
+    """Get user's statement parsing history"""
+    try:
+        current_user = get_jwt_identity()
+        
+        # Get transactions that were parsed from statements
+        parsed_transactions = Transaction.query.filter_by(user_id=current_user).all()
+        
+        # Group by date for history view
+        history = {}
+        for trans in parsed_transactions:
+            date_key = trans.timestamp.strftime('%Y-%m-%d')
+            if date_key not in history:
+                history[date_key] = {
+                    'date': date_key,
+                    'transaction_count': 0,
+                    'total_amount': 0,
+                    'categories': set()
+                }
+            
+            history[date_key]['transaction_count'] += 1
+            history[date_key]['total_amount'] += trans.amount
+            history[date_key]['categories'].add(trans.category)
+        
+        # Convert to list and format
+        history_list = []
+        for date_key in sorted(history.keys(), reverse=True):
+            item = history[date_key]
+            item['categories'] = list(item['categories'])
+            history_list.append(item)
+        
+        return jsonify({
+            'success': True,
+            'history': history_list[:20]  # Return last 20 entries
+        }), 200
+        
+    except Exception as e:
+        logger.error(f"Error fetching parsing history: {e}")
+        return jsonify({'error': 'Internal server error'}), 500
+
+# -------------------------
+# Smart transaction insights
+# -------------------------
+@app.route('/transaction-insights', methods=['GET'])
+@jwt_required()
+def get_transaction_insights():
+    """Get ML-powered transaction insights"""
+    try:
+        current_user = get_jwt_identity()
+        transactions = Transaction.query.filter_by(user_id=current_user).all()
+        
+        if not transactions:
+            return jsonify({'message': 'No transactions found'}), 200
+        
+        # Category spending analysis
+        category_spending = {}
+        monthly_trends = {}
+        
+        for trans in transactions:
+            # Category analysis
+            if trans.category not in category_spending:
+                category_spending[trans.category] = {'total': 0, 'count': 0, 'avg': 0}
+            
+            category_spending[trans.category]['total'] += trans.amount
+            category_spending[trans.category]['count'] += 1
+            
+            # Monthly trends
+            month_key = trans.timestamp.strftime('%Y-%m')
+            if month_key not in monthly_trends:
+                monthly_trends[month_key] = {'income': 0, 'expense': 0}
+            
+            if trans.type == 'income':
+                monthly_trends[month_key]['income'] += trans.amount
+            else:
+                monthly_trends[month_key]['expense'] += trans.amount
+        
+        # Calculate averages
+        for category in category_spending:
+            data = category_spending[category]
+            data['avg'] = data['total'] / data['count'] if data['count'] > 0 else 0
+        
+        # Find top spending categories
+        top_categories = sorted(
+            [(cat, data['total']) for cat, data in category_spending.items() if cat != 'salary'],
+            key=lambda x: x[1], reverse=True
+        )[:5]
+        
+        # Generate insights
+        insights = []
+        
+        if top_categories:
+            insights.append({
+                'type': 'spending_pattern',
+                'message': f"Your highest spending category is {top_categories[0][0]} with ₹{top_categories[0][1]:.2f}",
+                'category': top_categories[0][0],
+                'amount': top_categories[0][1]
+            })
+        
+        # Monthly comparison
+        if len(monthly_trends) >= 2:
+            months = sorted(monthly_trends.keys())
+            current_month = monthly_trends[months[-1]]
+            prev_month = monthly_trends[months[-2]]
+            
+            expense_change = ((current_month['expense'] - prev_month['expense']) / prev_month['expense'] * 100) if prev_month['expense'] > 0 else 0
+            
+            if abs(expense_change) > 20:
+                trend = "increased" if expense_change > 0 else "decreased"
+                insights.append({
+                    'type': 'monthly_trend',
+                    'message': f"Your expenses have {trend} by {abs(expense_change):.1f}% compared to last month",
+                    'change_percent': expense_change
+                })
+        
+        return jsonify({
+            'success': True,
+            'insights': insights,
+            'category_breakdown': category_spending,
+            'monthly_trends': monthly_trends,
+            'top_categories': top_categories
+        }), 200
+        
+    except Exception as e:
+        logger.error(f"Error generating insights: {e}")
+        return jsonify({'error': 'Internal server error'}), 500
+
+# -------------------------
+# All your existing routes remain unchanged
+# -------------------------
+
+# register
 @app.route('/register', methods=['POST'])
 def register():
     data = request.get_json()
@@ -79,14 +668,10 @@ def register():
 
     return jsonify({'message': 'User registered successfully'}), 201
 
-# -------------------------
 # transactions user
-# ------------------------- 
-
-
-@app.route('/transactions/user', methods=['GET'])  # also fix the route path
+@app.route('/transactions/user', methods=['GET'])
 @jwt_required()
-def get_user_transactions():  # <-- unique name
+def get_user_transactions():
     current_user = get_jwt_identity()
     print(f"👤 Authenticated user ID: {current_user}")
 
@@ -94,14 +679,7 @@ def get_user_transactions():  # <-- unique name
 
     return jsonify([t.to_dict() for t in transactions]), 200
 
-
-
-
-# -------------------------
 # login
-# ------------------------- 
-
-
 @app.route('/login', methods=['POST'])
 def login():
     data = request.get_json()
@@ -116,15 +694,10 @@ def login():
     else:
         return jsonify({'error': 'Invalid credentials'}), 401
 
-
-
- # -------------------------
 # category-breakdown
-# ------------------------- 
-
 @app.route('/category-breakdown')
 def category_breakdown():
-    txn_type = request.args.get("type", "expense")  # default: expense
+    txn_type = request.args.get("type", "expense")
     transactions = Transaction.query.filter_by(type=txn_type).all()
 
     category_totals = {}
@@ -134,10 +707,7 @@ def category_breakdown():
 
     return jsonify(category_totals)
 
-
-# -------------------------
 # GET /monthly-balance savings
-# -------------------------
 @app.route('/monthly-balance')
 def monthly_balance():
     transactions = Transaction.query.all()
@@ -165,13 +735,7 @@ def monthly_balance():
 
     return jsonify(result)
 
-
-
-# -------------------------
 # monthly-income-expense
-# -------------------------
-
-
 @app.route('/monthly-income-expense')
 def monthly_income_expense():
     transactions = Transaction.query.all()
@@ -192,10 +756,7 @@ def monthly_income_expense():
     ]
     return jsonify(result)
 
-
-# -------------------------
 # GET /transactions
-# -------------------------
 @app.route('/transactions', methods=['GET'])
 def get_transactions():
     query = Transaction.query
@@ -236,10 +797,7 @@ def get_transactions():
 
     return jsonify(result)
 
-
-# -------------------------
 # GET /summary
-# -------------------------
 @app.route('/summary', methods=['GET'])
 def get_summary():
     transactions = Transaction.query.all()
@@ -254,10 +812,7 @@ def get_summary():
         "balance": balance
     })
 
-
-# -------------------------
 # GET /monthly-summary
-# -------------------------
 @app.route("/monthly-summary", methods=["GET"])
 def get_monthly_summary():
     month_str = request.args.get("month")
@@ -283,9 +838,8 @@ def get_monthly_summary():
         "month": month_str,
         "summary": summary
     })
-# -------------------------
+
 # GET /monthly-summary-category
-# -------------------------
 @app.route('/summary-by-category')
 def summary_by_category():
     summary_data = db.session.query(
@@ -306,9 +860,7 @@ def summary_by_category():
 
     return jsonify(summary)
 
-# -------------------------
 # GET /balance
-# -------------------------
 @app.route('/balance')
 def get_balance():
     transactions = Transaction.query.all()
@@ -323,10 +875,7 @@ def get_balance():
         "balance": balance
     }
 
-
-# -------------------------
 # Run the app
-# -------------------------
 if __name__ == "__main__":
     with app.app_context():
         db.create_all()

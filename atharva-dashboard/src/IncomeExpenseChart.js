@@ -10,14 +10,28 @@ function IncomeExpenseChart() {
       .then(setData);
   }, []);
 
+  // Formatter for currency values
+  const formatRupee = (value) => `₹${value.toLocaleString("en-IN")}`;
+
   return (
-    <div style={{ marginTop: "2rem", background: "#1e1e1e", padding: "1rem", borderRadius: "12px", boxShadow: "0 0 10px #000" }}>
-      <h2 style={{ textAlign: "center", marginBottom: "1rem" }}>Monthly Income vs Expense</h2>
+    <div
+      style={{
+        marginTop: "2rem",
+        background: "#1e1e1e",
+        padding: "1rem",
+        borderRadius: "12px",
+        boxShadow: "0 0 10px #000",
+        color: "white"
+      }}
+    >
+      <h2 style={{ textAlign: "center", marginBottom: "1rem" }}>
+        Monthly Income vs Expense
+      </h2>
       <ResponsiveContainer width="100%" height={300}>
         <BarChart data={data}>
-          <XAxis dataKey="month" />
-          <YAxis />
-          <Tooltip />
+          <XAxis dataKey="month" stroke="#ccc" />
+          <YAxis tickFormatter={formatRupee} stroke="#ccc" />
+          <Tooltip formatter={(value) => formatRupee(value)} />
           <Legend />
           <Bar dataKey="income" fill="#4caf50" name="Income" />
           <Bar dataKey="expense" fill="#f44336" name="Expense" />

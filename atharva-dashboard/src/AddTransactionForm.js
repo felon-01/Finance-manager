@@ -8,34 +8,41 @@ export default function AddTransactionForm({ onAdd }) {
     description: "",
   });
 
+  const [isSubmitting, setIsSubmitting] = useState(false);
+
   const handleChange = (e) => {
     const { name, value } = e.target;
     setForm((prev) => ({
-  ...prev,
-  [name]: name === "amount" ? parseFloat(value) : value,
-}));
-
+      ...prev,
+      [name]: name === "amount" ? value : value, // Keep amount as string until submission
+    }));
   };
 
   const handleSubmit = async (e) => {
     e.preventDefault();
+    
+    // Prevent double submission
+    if (isSubmitting) return;
+    setIsSubmitting(true);
 
-    // Log the form data for debugging
-    console.log("📦 Sending form data:", form);
-    console.log("🔍 Final JSON payload:", JSON.stringify(form));
+    // Validate and prepare data for submission
+    const submissionData = {
+      ...form,
+      amount: parseFloat(form.amount) || 0, // Convert to number, default to 0 if invalid
+    };
+
+    // Basic validation
+    if (!submissionData.date || !submissionData.description || submissionData.amount <= 0) {
+      alert("Please fill in all fields with valid values");
+      setIsSubmitting(false);
+      return;
+    }
+
+    console.log("📦 Sending form data:", submissionData);
 
     try {
-      const res = await fetch("http://127.0.0.1:5000/transactions", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(form),
-      });
-
-      if (!res.ok) {
-        const errorText = await res.text();
-        console.error("❌ Server Error:", errorText);
-        throw new Error(errorText || "Failed to add transaction");
-      }
+      // Let the parent component handle the API call to avoid duplicate requests
+      await onAdd(submissionData);
 
       // Reset form on success
       setForm({
@@ -44,11 +51,12 @@ export default function AddTransactionForm({ onAdd }) {
         type: "expense",
         description: "",
       });
-
-      onAdd(); // Notify parent to refresh list
+      
     } catch (err) {
       alert("❌ Error adding transaction:\n" + err.message);
       console.error("Add transaction error:", err);
+    } finally {
+      setIsSubmitting(false);
     }
   };
 
@@ -67,6 +75,8 @@ export default function AddTransactionForm({ onAdd }) {
         />
         <input
           type="number"
+          step="0.01"
+          min="0"
           name="amount"
           value={form.amount}
           onChange={handleChange}
@@ -96,9 +106,14 @@ export default function AddTransactionForm({ onAdd }) {
 
       <button
         type="submit"
-        className="bg-indigo-600 text-white px-4 py-2 rounded hover:bg-indigo-700"
+        disabled={isSubmitting}
+        className={`px-4 py-2 rounded text-white ${
+          isSubmitting 
+            ? 'bg-gray-400 cursor-not-allowed' 
+            : 'bg-indigo-600 hover:bg-indigo-700'
+        }`}
       >
-        Add Transaction
+        {isSubmitting ? 'Adding...' : 'Add Transaction'}
       </button>
     </form>
   );
